@@ -195,6 +195,12 @@ class RpmRepository(Repository):
             1 or 0 corresponding to whether repo_gpgcheck should be enabled in the generated
             .repo file.
         sqlite_metadata (Boolean): Whether to generate sqlite metadata files on publish.
+        allowed_pub_keys (JSON):
+            A list of Public Key IDs (16-digit hex strings) if you want to require that all rpms
+            added to the Repo must be signed by one of them. This is a Pulp-side *data-sanity*
+            check, whereas gpgcheck triggers a client-side *security* restriction. You can find the
+            Key ID by importing the public key and then taking the last 16 digits from the hex
+            string in the output of `gpg --list-keys`.
     """
 
     TYPE = "rpm"
@@ -227,6 +233,7 @@ class RpmRepository(Repository):
     gpgcheck = models.IntegerField(default=0, choices=GPGCHECK_CHOICES)
     repo_gpgcheck = models.IntegerField(default=0, choices=GPGCHECK_CHOICES)
     sqlite_metadata = models.BooleanField(default=False)
+    allowed_pub_keys = models.JSONField(default=list)
 
     def on_new_version(self, version):
         """
@@ -285,6 +292,7 @@ class RpmRepository(Repository):
         """
         Ensure there are no duplicates in a repo version and content is not broken.
 
+        If set, remove Packages that are not signed by one of the allowed_pub_keys public keys.
         Remove duplicates based on repo_key_fields.
         Ensure that modulemd is added with all its RPMs.
         Ensure that modulemd is removed with all its RPMs.
@@ -302,6 +310,7 @@ class RpmRepository(Repository):
             except RepositoryVersion.DoesNotExist:
                 previous_version = None
 
+        self._check_signatures(new_version)
         remove_duplicates(new_version)
         self._resolve_distribution_trees(new_version, previous_version)
 
@@ -336,6 +345,20 @@ class RpmRepository(Repository):
                     "{value_errors}"
                 ).format(repo=new_version.repository.name, value_errors=str(ve))
             )
+    
+    def _check_signatures(self, new_version):
+        """If requested, validate that the added rpms are signed appropriately."""
+        if self.allowed_pub_keys:
+            rejected_nevras = []
+            for package in Package.objects.filter(pk__in=new_version.added()).iterator():
+                if str(package.signer_key_id) not in self.allowed_pub_keys:
+                    rejected_nevras.append(package.nevra)
+            if rejected_nevras:
+                raise Exception(
+                    f"Repo {self.name} has specified that packages must be signed by one of the "
+                    f"following keys: \n{self.allowed_pub_keys} \nThe following packages are not "
+                    f"signed appropriately and the update has been rejected: \n{rejected_nevras}"
+                )
 
     def _apply_retention_policy(self, new_version):
         """Apply the repository's "retain_package_versions" settings to the new version.
