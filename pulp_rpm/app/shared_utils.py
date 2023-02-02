@@ -1,11 +1,19 @@
 import createrepo_c as cr
-import tempfile
-import shutil
 from hashlib import sha256
+from logging import getLogger
+import os
+import tempfile
+import traceback
+import shutil
+import subprocess
+
+import rpm
 
 from django.conf import settings
 from django.core.files.storage import default_storage as storage
 from django.utils.dateparse import parse_datetime
+
+log = getLogger(__name__)
 
 
 def format_nevra(name=None, epoch=0, version=None, release=None, arch=None):
@@ -51,9 +59,10 @@ def read_crpackage_from_artifact(artifact):
         cr_pkginfo = cr.package_from_rpm(
             temp_file.name, changelog_limit=settings.KEEP_CHANGELOG_LIMIT
         )
+        signer_key_id = parse_signer_id(temp_file.name)
 
     artifact_file.close()
-    return cr_pkginfo
+    return cr_pkginfo, signer_key_id
 
 
 def urlpath_sanitize(*args):
@@ -159,3 +168,70 @@ def parse_time(value):
         int | datetime | None: formatted time value
     """
     return int(value) if value.isdigit() else parse_datetime(value)
+
+
+def parse_signer_id(rpm_path):
+    """
+    Parse the key_id of the signing key from the RPM header, given a locally-available RPM.
+
+    Args:
+        rpm_path(str): Path to the local RPM file.
+
+    Returns:
+        str: 16-digit hex key_id of signing key, or None.
+    """
+    # I have filed an Issue with createrepo_c requesting the ability to access the signature
+    # through the python bindings. Until that is available we'll have to read the header
+    # a second time with a utility that actually makes it available.
+    # https://github.com/rpm-software-management/createrepo_c/issues/346
+    # TODO: When the above is resolved re-evaluate and potentially drop extra dependencies.
+    signature = ""
+    ts = rpm.TransactionSet()
+    fdno = None
+    try:
+        fdno = os.open(rpm_path, os.O_RDONLY)
+        hdr = ts.hdrFromFdno(fdno)
+    except:
+        log.info(f"Could not extract header from RPM file: {rpm_path}")
+        log.info(traceback.format_exc())
+        return None
+    finally:
+        if fdno:
+            os.close(fdno)
+
+    # What the `rpm -qi` command does. See "--info" definition in /usr/lib/rpm/rpmpopt-*
+    signature = (
+        hdr[rpm.RPMTAG_DSAHEADER]
+        or hdr[rpm.RPMTAG_RSAHEADER]
+        or hdr[rpm.RPMTAG_SIGGPG]
+        or hdr[rpm.RPMTAG_SIGPGP]
+    )
+
+    signer_key_id = ""  # If package is unsigned, store empty str
+    if signature:
+        try:
+            signer_key_id = gpg_fetch_signer_id(signature)
+        except:
+            signer_key_id = None  # If error (or never examined), store None
+            log.info(f"Could not parse PGP signature for {hdr[rpm.RPMTAG_NEVRA]}")
+            log.info(traceback.format_exc())
+    return signer_key_id
+
+
+def gpg_fetch_signer_id(signature):
+    """
+    Call out to gpg to fetch the Signer's ID from a given in-memory binary signature.
+    """
+    # Note: the verification always "fails", because we're "verifying" that the signature
+    # is valid for an empty datafile. We aren't actually trying to re-create whatever rpmkeys does,
+    # just get gpg to parse the signature and tell us what the Signer ID is.
+    with tempfile.NamedTemporaryFile() as data, tempfile.NamedTemporaryFile() as sig:
+        sig.write(signature)
+        sig.flush()
+        result = subprocess.run(
+            ["gpg", "--status-fd", "1", "--verify", sig.name, data.name], capture_output=True
+        )
+    for line in str(result.stdout, "utf-8").split("\n"):
+        if line.startswith("[GNUPG:] BADSIG"):
+            return line.split()[2]
+    return None
