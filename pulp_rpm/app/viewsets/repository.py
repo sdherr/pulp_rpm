@@ -4,7 +4,6 @@ from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.serializers import ValidationError as DRFValidationError
-
 from pulpcore.plugin.actions import ModifyRepositoryActionMixin
 from pulpcore.plugin.models import RepositoryVersion
 from pulpcore.plugin.tasking import dispatch
@@ -558,6 +557,9 @@ class RpmPublicationViewSet(PublicationViewSet, RolesMixin):
         }
         if checkpoint:
             kwargs["checkpoint"] = True
+        # If the repo or the api call had a layout specified, pass it to the publish task.
+        if layout := serializer.validated_data.get("layout", repository.layout):
+            kwargs["layout"] = layout
         result = dispatch(
             tasks.publish,
             shared_resources=[repository_version.repository],
